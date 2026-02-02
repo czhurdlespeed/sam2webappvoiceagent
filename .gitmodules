@@ -1,3 +1,3 @@
 [submodule "agent-starter-embed"]
 	path = agent-starter-embed
-	url = git@github.com:livekit-examples/agent-starter-embed.git
+	url = git@github.com:czhurdlespeed/agent-starter-embed.git
