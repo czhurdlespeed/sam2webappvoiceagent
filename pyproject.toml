@@ -1,0 +1,18 @@
+[project]
+name = "lemonslice"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "certifi",
+    "landingai-ade>=1.5.0",
+    "livekit-agents[cartesia,google,mcp]~=1.3",
+    "livekit-plugins-lemonslice>=1.3.12",
+    "livekit-plugins-noise-cancellation>=0.2.5",
+    "livekit-plugins-silero>=1.3.12",
+    "livekit-plugins-turn-detector>=1.3.12",
+    "parallel-web>=0.4.1",
+    "pymongo>=4.16.0",
+    "python-dotenv",
+    "pyyaml",
+    "voyageai>=0.3.7",
+]

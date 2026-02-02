@@ -1,0 +1,6 @@
+.venv/
+src/__pycache__/
+*.env.local
+*.env
+.livekit/
+sam2ragdocs/*
