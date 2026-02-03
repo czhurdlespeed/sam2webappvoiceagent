@@ -375,23 +375,32 @@ class RAG:
         """Format RAG results as a concise string for LLM consumption."""
         if not results:
             return "No relevant documents found for this query."
-        parts = []
-        for i, doc in enumerate(results, 1):
+        rag_string = "Here are the most relevant documents in the knowledge base for your query. The relevance score is a measure of how closely the document is related to the user's query. The documents are sorted by relevance score in descending order. Summarize the documents into a concise response that answers the user's question. The response will be used by a text-to-speech engine to be read aloud to the user.\n\n"
+        for idx, doc in enumerate(results, 1):
+            string = ""
             text = doc.get("text", "").strip()
             score = doc.get("relevance_score")
-            if text:
-                parts.append(
-                    f"[{i}] (relevance: {score:.2f})\n{text[:2000]}{'...' if len(text) > 2000 else ''}"
-                )
-        return "\n\n".join(parts)
+            string += f"# Document [{idx}]\n"
+            string += (
+                f"# Relevance Score: {score:.2f}\n"
+                if isinstance(score, float)
+                else "Relevance Score: N/A"
+            )
+            string += "# Document Content:\n\n"
+            string += text + "\n\n"
+            string += f"{'':-^50}\n"
+            rag_string += string
+        return rag_string
 
 
 async def main() -> None:
     mongodb = await MongoDB.create()
     rag = RAG(vector_database=mongodb)
-    await rag.get_query_results(
-        query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?"
+    results = await rag.get_query_results(
+        query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?",
+        verbose=False,
     )
+    print(RAG.format_results_for_llm(results))
     await mongodb.close_shared_client()
 
 
