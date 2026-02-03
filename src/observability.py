@@ -15,6 +15,18 @@ def setup_observability():
     logfire_token = os.getenv("LOGFIRE_TOKEN")
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
     otlp_headers = os.getenv("OTEL_EXPORTER_OTLP_HEADERS")
+    if not logfire_token:
+        raise ValueError(
+            "LOGFIRE_TOKEN is not set. Add LOGFIRE_TOKEN to .env.local or set the environment variable."
+        )
+    if not otlp_endpoint:
+        raise ValueError(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is not set. Add OTEL_EXPORTER_OTLP_ENDPOINT to .env.local or set the environment variable."
+        )
+    if not otlp_headers:
+        raise ValueError(
+            "OTEL_EXPORTER_OTLP_HEADERS is not set. Add OTEL_EXPORTER_OTLP_HEADERS to .env.local or set the environment variable."
+        )
 
     # Parse headers string into dict (format: "Key1=Value1,Key2=Value2")
     headers = {}

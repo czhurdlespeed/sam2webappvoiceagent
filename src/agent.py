@@ -30,6 +30,8 @@ from rag import RAG, MongoDB
 # Load from project root so it works when cwd is not the repo root (e.g. in container job subprocess)
 load_dotenv(".env.local")
 
+MAX_COMPLETION_TOKENS = 150
+
 
 class Assistant(Agent):
     def __init__(self, rag: RAG | None = None) -> None:
@@ -105,7 +107,10 @@ async def entrypoint(ctx: JobContext):
         stt=inference.STT(model="cartesia/ink-whisper", language="en"),
         llm=inference.LLM(
             model="gemini-2.5-flash",
-            extra_kwargs={"max_completion_tokens": 150, "max_tokens": 150},
+            extra_kwargs={
+                "max_completion_tokens": MAX_COMPLETION_TOKENS,
+                "max_tokens": MAX_COMPLETION_TOKENS,
+            },
         ),
         tts=inference.TTS(
             model="cartesia/sonic-3",

@@ -381,7 +381,11 @@ class RAG:
             text = doc.get("text", "").strip()
             score = doc.get("relevance_score")
             string += f"# Document [{idx}]\n"
-            string += f"# Relevance Score: {score:.2f}\n"
+            string += (
+                f"# Relevance Score: {score:.2f}\n"
+                if isinstance(score, float)
+                else "Relevance Score: N/A"
+            )
             string += "# Document Content:\n\n"
             string += text + "\n\n"
             string += f"{'':-^50}\n"

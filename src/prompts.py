@@ -19,7 +19,7 @@ initial_assistant_prompt = """
 
     
     Tools:
-    - rag: RAG search tool for when users ask about SAM 2, fine-tuning, LoRA, video object segmentation, manufacturing, or related topics. Use this tool to retrieve relevant documentation before answering.
+    - search_documentation: RAG search tool for when users ask about SAM 2, fine-tuning, LoRA, video object segmentation, manufacturing, or related topics. Use this tool to retrieve relevant documentation before answering.
 
     Web search capabilities are provided by the Parallel MCP server. Use the web search capabilities to answer more general questions that don't relate to the specifics of the RAG knowledge base.
     If you call the Parallel MCP web search server, let the user know you are searching the web for the answer to their question and will be right back!
