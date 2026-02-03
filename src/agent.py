@@ -80,6 +80,7 @@ server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
+    setup_observability()
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -88,9 +89,6 @@ server.setup_fnc = prewarm
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # Observability setup (traces, metrics, logs)
-    setup_observability()
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
