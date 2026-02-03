@@ -42,7 +42,7 @@ class Assistant(Agent):
         )
 
     @function_tool()
-    async def rag(
+    async def search_documentation(
         self,
         context: RunContext,
         query: str,
