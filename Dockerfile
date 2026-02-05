@@ -77,7 +77,7 @@ USER appuser
 # Pre-download any ML models or files the agent needs
 # This ensures the container is ready to run immediately without downloading
 # dependencies at runtime, which improves startup time and reliability
-RUN uv run python3 "src/agent.py" download-files
+RUN uv run python3 src/agent.py download-files
 
 # Run the application using UV
 # UV will activate the virtual environment and run the agent.

@@ -3,7 +3,7 @@ build:
 
 run:
 	find ./src -type d -name __pycache__ -exec rm -rf {} +
-	podman run --name lemonslice -it -p 7880:7880 --user root -v ./src:/app/src:Z lemonslice /bin/bash
+	podman run -e HOME=/app --name lemonslice -it -p 7880:7880 --user root -v ./src:/app/src:Z lemonslice /bin/bash
 	
 
 attach:
