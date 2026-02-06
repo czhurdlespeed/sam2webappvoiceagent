@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 
@@ -38,7 +39,12 @@ load_dotenv(".env.local")
 
 
 class Assistant(Agent):
-    def __init__(self, parallel_client: AsyncParallel, rag: RAG) -> None:
+    def __init__(
+        self,
+        parallel_client: AsyncParallel,
+        rag: RAG,
+        user_data: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(instructions=initial_assistant_prompt)
         assert isinstance(parallel_client, AsyncParallel), (
             "parallel_client must be an instance of AsyncParallel"
@@ -46,11 +52,15 @@ class Assistant(Agent):
         assert isinstance(rag, RAG), "rag must be an instance of RAG"
         self._parallel_client = parallel_client
         self._rag = rag
+        self._user_data = user_data or {}
 
     async def on_enter(self):
-        await self.session.generate_reply(
-            instructions="In one sentence, introduce yourself, welcome the user, and ask them how you can help them today."
-        ).wait_for_playout()
+        name = self._user_data.get("name", "").strip()
+        if name:
+            instructions = f"In one sentence, introduce yourself, welcome {name}, and ask how you can help them today."
+        else:
+            instructions = "In one sentence, introduce yourself, welcome the user, and ask them how you can help them today."
+        await self.session.generate_reply(instructions=instructions).wait_for_playout()
 
     async def on_user_turn_completed(
         self, turn_ctx: ChatContext, new_message: ChatMessage
@@ -148,10 +158,18 @@ async def on_session_end(ctx: JobContext) -> None:
     logfire.info(f"Session Report 📜👇\n{report}")
 
 
-@server.rtc_session(on_session_end=on_session_end)
+@server.rtc_session(on_session_end=on_session_end, agent_name="sam2webappassistant")
 async def entrypoint(ctx: JobContext):
+    user_data: dict[str, str] = {}
+    if ctx.job.metadata:
+        try:
+            user_data = json.loads(ctx.job.metadata)
+        except json.JSONDecodeError:
+            pass
+    logfire.info(f" Job metadata {ctx.job.metadata} parsed_user_data={user_data}")
     ctx.log_context_fields = {
         "room": ctx.room.name,
+        **{k: v for k, v in user_data.items() if isinstance(v, str)},
     }
 
     session = AgentSession(
@@ -178,9 +196,13 @@ async def entrypoint(ctx: JobContext):
             time_limit = int(os.getenv("SESSION_TIME_LIMIT_SECONDS", "90"))
 
             time_start = time.time()
+            last_logged_interval = 0
             while time.time() - time_start < time_limit:
                 await asyncio.sleep(1)
-                if (time.time() - time_start) % 10 == 0:
+                elapsed = int(time.time() - time_start)
+                current_interval = elapsed // 10
+                if current_interval > last_logged_interval:
+                    last_logged_interval = current_interval
                     logfire.info(
                         f"{time_limit - (time.time() - time_start):.0f} seconds remaining"
                     )
@@ -230,6 +252,7 @@ async def entrypoint(ctx: JobContext):
         agent=Assistant(
             parallel_client=ctx.proc.userdata["parallel_client"],
             rag=ctx.proc.userdata["rag"],
+            user_data=user_data,
         ),
         room=ctx.room,
         room_options=room_io.RoomOptions(

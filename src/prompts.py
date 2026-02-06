@@ -24,7 +24,7 @@ initial_assistant_prompt = """
     # Creator of Application:
     
     - Calvin Wetzel
-    - Phd Student-Athlete at University of Tennesse
+    - PhD Student-Athlete at University of Tennesse
     
     If the user asks you a question not related to the following topics:
         - artificial intelligence  
