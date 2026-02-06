@@ -18,5 +18,6 @@ dependencies = [
     "pymongo>=4.16.0",
     "python-dotenv",
     "pyyaml",
+    "rich>=14.3.2",
     "voyageai>=0.3.7",
 ]

@@ -3,7 +3,7 @@ import os
 from abc import ABC, abstractmethod
 from functools import partial
 from pathlib import Path
-from typing import Callable, ClassVar, Iterator, List, Tuple
+from typing import Callable, Iterator, List, Tuple
 
 import certifi
 import pymongo
@@ -42,12 +42,7 @@ class VectorDatabase(ABC):
 
     @property
     @abstractmethod
-    def document_embedding_model(self):
-        pass
-
-    @property
-    @abstractmethod
-    def query_embedding_model(self):
+    def embedding_model(self):
         pass
 
     @abstractmethod
@@ -76,31 +71,17 @@ def parse_pdfs(pdf_directory: Path) -> None:
 
 
 class MongoDB(VectorDatabase):
-    """All instances share the same AsyncMongoClient connection (connection pool)."""
-
-    _client: ClassVar[AsyncMongoClient | None] = None
-
     def __init__(self) -> None:
-        self._database: AsyncMongoClient | None = None
+        self._client: AsyncMongoClient | None = None
         self._voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
 
     @property
     def database(self) -> AsyncMongoClient | None:
-        return self._database
+        return self._client
 
-    @classmethod
-    async def create(cls) -> "MongoDB":
-        """Create and connect to MongoDB. Reuses the shared client if already connected."""
-        instance = cls()
-        await instance.connect()
-        return instance
-
-    async def connect(self) -> None:
-        if MongoDB._client is not None:
-            self._database = MongoDB._client
-            return
+    def connect(self) -> None:
         try:
-            client = AsyncMongoClient(
+            self._client = AsyncMongoClient(
                 MONGO_URI,
                 tlsCAFile=certifi.where(),
                 server_api=pymongo.server_api.ServerApi(
@@ -109,25 +90,16 @@ class MongoDB(VectorDatabase):
                     deprecation_errors=True,
                 ),
             )
-            await client.admin.command("ping")
             print("[green]Connected successfully to MongoDB[/green]")
-            MongoDB._client = client
-            self._database = MongoDB._client
         except Exception as e:
             raise Exception(f"[red]Error connecting to MongoDB: {e}[/red]")
 
     async def disconnect(self) -> None:
         """Stop using the connection for this instance. Does not close the shared client."""
-        self._database = None
-
-    @classmethod
-    async def close_shared_client(cls) -> None:
-        """Close the shared MongoDB client. Call at process shutdown if needed."""
-        if cls._client is None:
+        if self._client is None:
             return
-        await cls._client.close()
-        cls._client = None
-        print("[green]Disconnected from MongoDB[/green]")
+        await self._client.close()
+        self._client = None
 
     async def create_collection(self, collection_name: str) -> None:
         if self._database is None:
@@ -157,23 +129,10 @@ class MongoDB(VectorDatabase):
         return await self.database["sam2webappdocs"].list_collection_names()
 
     @property
-    def document_embedding_model(self) -> Callable[List[List[str]], List[float]]:
+    def embedding_model(self) -> Callable[List[List[str]], List[float]]:
         return partial(
             self._voyage_client.contextualized_embed,
             model=VOYAGE_EMBEDDING_MODEL,
-            input_type="document",
-            output_dimension=1024,
-        )
-
-    @property
-    def query_embedding_model(self):
-        """Embed queries with the same model as documents (contextualized_embed)
-        so query and document vectors are in the same space for similarity search."""
-
-        return partial(
-            self._voyage_client.contextualized_embed,
-            model=VOYAGE_EMBEDDING_MODEL,
-            input_type="query",
             output_dimension=1024,
         )
 
@@ -235,7 +194,7 @@ class MongoDB(VectorDatabase):
 
 
 class RAG:
-    def __init__(self, vector_database: VectorDatabase):
+    def __init__(self, vector_database: MongoDB):
         self.vector_database = vector_database
 
     BATCH_TOKEN_LIMIT = 120_000
@@ -247,7 +206,7 @@ class RAG:
         return sum(len(t) for t in tokenized)
 
     @staticmethod
-    def split_document_if_too_many_tokens(
+    def _split_document_if_too_many_tokens(
         chunks: List[str], document_name: str
     ) -> List[List[str]]:
         client = voyageai.Client(api_key=VOYAGE_API_KEY)
@@ -273,7 +232,7 @@ class RAG:
             for i in range(len(boundaries) - 1)
         ]
 
-    def chunk_documents(self, document_dir: Path) -> List[List[str]]:
+    def _chunk_documents(self, document_dir: Path) -> List[List[str]]:
         documents_chunks = []
         for document in document_dir.glob("*.md"):
             with open(document, "r") as f:
@@ -284,7 +243,7 @@ class RAG:
             )
             chunks = list(filter(lambda x: x != "", chunks))
             documents_chunks.extend(
-                self.split_document_if_too_many_tokens(chunks, document.name)
+                self._split_document_if_too_many_tokens(chunks, document.name)
             )
         return documents_chunks
 
@@ -306,13 +265,13 @@ class RAG:
             batches.append(current_batch)
         return batches
 
-    async def upload_to_database(self) -> List:
-        documents_chunks = self.chunk_documents(Path("sam2ragdocs/markdown"))
+    async def upload_to_database(self, document_dir: Path) -> List:
+        documents_chunks = self._chunk_documents(document_dir)
         batches = self._batch_by_tokens(documents_chunks)
         all_pairs: List[Tuple[List[str], object]] = []
         for batch in batches:
-            results = self.vector_database.document_embedding_model(
-                inputs=batch
+            results = self.vector_database.embedding_model(
+                inputs=batch, input_type="document"
             ).results
             for doc, doc_embeddings in zip(batch, results):
                 all_pairs.append((doc, doc_embeddings))
@@ -327,7 +286,7 @@ class RAG:
     ) -> List[dict]:
         collection = self.vector_database.database["sam2webappdocs"]["vectorstore"]
         query_embedding = (
-            self.vector_database.query_embedding_model(inputs=[[query]])
+            self.vector_database.embedding_model(inputs=[[query]], input_type="query")
             .results[0]
             .embeddings[0]
         )
@@ -354,8 +313,7 @@ class RAG:
         if not results:
             return []
         documents = [doc["text"] for doc in results]
-        voyage_client = self.vector_database._voyage_client
-        reranking = voyage_client.rerank(
+        reranking = self.vector_database._voyage_client.rerank(
             query=query,
             documents=documents,
             model="rerank-2.5",
@@ -394,14 +352,15 @@ class RAG:
 
 
 async def main() -> None:
-    mongodb = await MongoDB.create()
+    mongodb = MongoDB()
+    mongodb.connect()
     rag = RAG(vector_database=mongodb)
     results = await rag.get_query_results(
         query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?",
         verbose=False,
     )
     print(RAG.format_results_for_llm(results))
-    await mongodb.close_shared_client()
+    await mongodb.disconnect()
 
 
 if __name__ == "__main__":
