@@ -75,11 +75,14 @@ class Assistant(Agent):
             turn_ctx.add_message(
                 role="assistant", content=RAG.format_results_for_llm(rag_results)
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logfire.error(
-                f"RAG search failed for query: {new_message.text_content} with error: {e}"
+            logfire.error("RAG search failed", error=e)
+            turn_ctx.add_message(
+                role="assistant",
+                content="Sorry, I couldn’t access the knowledge base just now. Please try again.",
             )
-            turn_ctx.add_message(role="assistant", content=f"RAG search failed: {e}")
 
     @function_tool()
     async def web_search(
@@ -109,7 +112,6 @@ class Assistant(Agent):
             ).wait_for_playout()
 
         speak_task = asyncio.create_task(_speak_status_update())
-
         try:
             websites: SearchResult = await self._parallel_client.beta.search(
                 objective=objective,
@@ -119,9 +121,6 @@ class Assistant(Agent):
                 mode="agentic",
             )
 
-            speak_task.cancel()
-            await asyncio.gather(speak_task, return_exceptions=True)
-
             results = "Here are the top 3 results from the web search:\n\n"
             for search_result in websites.results:
                 results += f"# {search_result.title}\n"
@@ -129,11 +128,15 @@ class Assistant(Agent):
                 results += f"Published Date: {search_result.publish_date}\n"
                 results += f"Excerpt: {search_result.excerpts}\n"
                 results += f"{'':-^50}\n"
+            return results
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logfire.error("Web search failed", error=e)
-            return f"Web search failed: {e}"
-
-        return results
+            return "Web search failed."
+        finally:
+            speak_task.cancel()
+            await asyncio.gather(speak_task, return_exceptions=True)
 
 
 server = AgentServer()
