@@ -329,8 +329,13 @@ class RAG:
         return reranked
 
     @staticmethod
-    def format_results_for_llm(results: List[dict]) -> str:
+    def format_results_for_llm(
+        results: List[dict], relavence_threshold: float = 0.8
+    ) -> str:
         """Format RAG results as a concise string for LLM consumption."""
+        results = list(
+            filter(lambda x: x.get("relevance_score") >= relavence_threshold, results)
+        )
         if not results:
             return "No relevant documents found for this query."
         rag_string = "Here are the most relevant documents in the knowledge base for your query. The relevance score is a measure of how closely the document is related to the user's query. The documents are sorted by relevance score in descending order. Summarize the documents into a concise response that answers the user's question. The response will be used by a text-to-speech engine to be read aloud to the user.\n\n"
@@ -359,7 +364,7 @@ async def main() -> None:
         query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?",
         verbose=False,
     )
-    print(RAG.format_results_for_llm(results))
+    print(RAG.format_results_for_llm(results, relavence_threshold=0.85))
     await mongodb.disconnect()
 
 
