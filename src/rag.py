@@ -337,8 +337,8 @@ class RAG:
             filter(lambda x: x.get("relevance_score") >= relavence_threshold, results)
         )
         if not results:
-            return "No relevant documents found for this query."
-        rag_string = "Here are the most relevant documents in the knowledge base for your query. The relevance score is a measure of how closely the document is related to the user's query. The documents are sorted by relevance score in descending order. Summarize the documents into a concise response that answers the user's question. The response will be used by a text-to-speech engine to be read aloud to the user.\n\n"
+            return ""
+        rag_string = "Additional information from the knowledge base relevant to the user's query:\n\n"
         for idx, doc in enumerate(results, 1):
             string = ""
             text = doc.get("text", "").strip()
