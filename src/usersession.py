@@ -101,7 +101,7 @@ async def fetch_user_time_used(user_id: str) -> int:
             .where(UserSession.user_id == user_id)
             .order_by(UserSession.created_at.desc())
         )
-        return sum(user_session.seconds_used for user_session in result.all() or 0)
+        return sum(user_session.seconds_used for user_session in result.all())
 
 
 async def protected_create_session(user_id: str, session_id: int) -> UserSession | None:
@@ -118,7 +118,7 @@ async def protected_create_session(user_id: str, session_id: int) -> UserSession
 async def main():
     # await drop_tables(UserSession)
     # await create_tables()
-    pass
+    print(await fetch_user_time_used("123"))
 
 
 if __name__ == "__main__":
