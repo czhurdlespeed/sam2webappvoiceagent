@@ -7,79 +7,40 @@ from livekit.agents.telemetry import set_tracer_provider
 
 load_dotenv(".env.local")
 
+# Guard to prevent duplicate setup when prewarm runs multiple times in the same process
+_observability_initialized = False
+
 
 def setup_observability():
     """Configure OpenTelemetry traces, metrics, and logs to export to Logfire."""
+    global _observability_initialized
 
-    # Get configuration from environment
+    if _observability_initialized:
+        return
+    _observability_initialized = True
+
     logfire_token = os.getenv("LOGFIRE_TOKEN")
-    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-    otlp_headers = os.getenv("OTEL_EXPORTER_OTLP_HEADERS")
     if not logfire_token:
         raise ValueError(
             "LOGFIRE_TOKEN is not set. Add LOGFIRE_TOKEN to .env.local or set the environment variable."
         )
-    if not otlp_endpoint:
-        raise ValueError(
-            "OTEL_EXPORTER_OTLP_ENDPOINT is not set. Add OTEL_EXPORTER_OTLP_ENDPOINT to .env.local or set the environment variable."
-        )
-    if not otlp_headers:
-        raise ValueError(
-            "OTEL_EXPORTER_OTLP_HEADERS is not set. Add OTEL_EXPORTER_OTLP_HEADERS to .env.local or set the environment variable."
-        )
 
-    # Parse headers string into dict (format: "Key1=Value1,Key2=Value2")
-    headers = {}
-    if otlp_headers:
-        for pair in otlp_headers.split(","):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                headers[key.strip()] = value.strip()
+    def scrubbing_callback(match: logfire.ScrubMatch):
+        path_str = ".".join(str(p) for p in match.path) if match.path else ""
+        if "session_id" in path_str and isinstance(match.value, int):
+            return match.value
+        return None
 
-    # Configure Logfire (provides its own instrumentation)
-    logfire.configure(service_name="voice-agent", token=logfire_token)
-
-    # Import OpenTelemetry components
-    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-    # Create a shared resource for all telemetry
-    resource = Resource.create(attributes={SERVICE_NAME: "voice-agent"})
-
-    # --- Traces ---
-    trace_provider = TracerProvider(resource=resource)
-    trace_provider.add_span_processor(
-        BatchSpanProcessor(
-            OTLPSpanExporter(
-                endpoint=f"{otlp_endpoint}/v1/traces",
-                headers=headers,
-            )
-        )
-    )
-    set_tracer_provider(trace_provider)  # LiveKit-specific
-
-    # --- Logs ---
-    logger_provider = LoggerProvider(resource=resource)
-    logger_provider.add_log_record_processor(
-        BatchLogRecordProcessor(
-            OTLPLogExporter(
-                endpoint=f"{otlp_endpoint}/v1/logs",
-                headers=headers,
-            )
-        )
+    logfire.configure(
+        service_name="voice-agent",
+        token=logfire_token,
+        scrubbing=logfire.ScrubbingOptions(callback=scrubbing_callback),
     )
 
-    # Attach OTEL handler to root logger to capture all Python logging
-    otel_handler = LoggingHandler(
-        level=logging.DEBUG,
-        logger_provider=logger_provider,
-    )
-    logging.getLogger().addHandler(otel_handler)
+    # Ensure LiveKit uses the same tracer provider that Logfire configured
+    from opentelemetry import trace
+
+    set_tracer_provider(trace.get_tracer_provider())
 
     # Optionally set log level for specific noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
