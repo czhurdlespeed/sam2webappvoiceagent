@@ -44,7 +44,9 @@ from usersession import (
     UserSession,
     fetch_user_info,
     fetch_user_sessions,
+    fetch_user_time_used,
     protected_create_session,
+    user_exists,
     write_user_session,
 )
 
@@ -218,6 +220,24 @@ async def on_request(request: JobRequest) -> None:
         )
         await request.reject()
         return
+    user_exists_in_db = await user_exists(user_data.user_id)
+    if not user_exists_in_db:
+        logfire.error(
+            "Job rejected: user does not exist",
+            job_id=request.id,
+            user_id=user_data.user_id,
+        )
+        await request.reject()
+        return
+    time_used = await fetch_user_time_used(user_data.user_id)
+    if time_used >= int(os.getenv("SESSION_TIME_LIMIT_SECONDS", "120")):
+        logfire.error(
+            "Job rejected: user has reached the session time limit",
+            job_id=request.id,
+            user_id=user_data.user_id,
+        )
+        await request.reject()
+        return
     await request.accept()
 
 
@@ -315,14 +335,12 @@ async def entrypoint(ctx: JobContext):
                         logfire.info(f"{time_limit - elapsed:.0f} seconds remaining")
             else:
                 elapsed = int(time.time() - time_start)
-                # Session may not be started yet; wait for it before using generate_reply
                 await session_ready.wait()
 
             logfire.info(
                 "Session time limit reached", time_limit=time_limit, elapsed=elapsed
             )
             try:
-                # Interrupt any ongoing response, then announce and disconnect
                 await session.interrupt(force=True)
                 if user_session.session_id > 0:
                     await session.generate_reply(

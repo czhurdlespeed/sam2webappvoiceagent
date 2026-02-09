@@ -83,6 +83,27 @@ async def create_user_session(user_id: str, session_id: int) -> UserSession:
         return user_session
 
 
+async def user_exists(user_id: str) -> bool:
+    async with AsyncSession(engine) as session:
+        result = await session.exec(select(User).where(User.id == user_id))
+        result = result.first()
+        if result is None:
+            return False
+        elif result.id is None or result.email_verified is False:
+            return False
+        return True
+
+
+async def fetch_user_time_used(user_id: str) -> int:
+    async with AsyncSession(engine) as session:
+        result = await session.exec(
+            select(UserSession)
+            .where(UserSession.user_id == user_id)
+            .order_by(UserSession.created_at.desc())
+        )
+        return sum(user_session.seconds_used for user_session in result.all() or 0)
+
+
 async def protected_create_session(user_id: str, session_id: int) -> UserSession | None:
     try:
         return await asyncio.wait_for(
