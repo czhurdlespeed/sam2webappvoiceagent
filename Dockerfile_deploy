@@ -1,8 +1,6 @@
-# This is an example Dockerfile that builds a minimal container for running LK Agents
-# For more information on the build process, see https://docs.livekit.io/agents/ops/deployment/builds/
 # syntax=docker/dockerfile:1
 
-# Use the official UV Python base image with Python 3.13 on Debian Bookworm
+# Use the official UV Python base image with Python 3.11 on Debian Bookworm
 # UV is a fast Python package manager that provides better performance than pip
 # We use the slim variant to keep the image size smaller while still having essential tools
 ARG PYTHON_VERSION=3.13
@@ -14,37 +12,23 @@ ENV PYTHONUNBUFFERED=1
 
 # Create a non-privileged user that the app will run under.
 # See https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#user
-# Pass UID/GID at build time (e.g. --build-arg UID=$(id -u) --build-arg GID=$(id -g)) so the
-# container user matches your host user and volume mounts are readable/writable.
 ARG UID=10001
-ARG GID=10001
-RUN groupadd --gid "${GID}" appuser \
-    && adduser \
+RUN adduser \
     --disabled-password \
     --gecos "" \
     --home "/app" \
     --shell "/sbin/nologin" \
     --uid "${UID}" \
-    --ingroup appuser \
     appuser
 
 # Install build dependencies required for Python packages with native extensions
 # gcc: C compiler needed for building Python packages with C extensions
-# g++: C++ compiler needed for building Python packages with C++ extensions
 # python3-dev: Python development headers needed for compilation
 # We clean up the apt cache after installation to keep the image size down
 RUN apt-get update && apt-get install -y \
     gcc \
-    g++ \
     python3-dev \
-    jq \ 
-    portaudio19-dev \ 
-    libportaudio2 \
-    vim \
-    curl \
-    && curl -sSL https://get.livekit.io/cli | bash \
   && rm -rf /var/lib/apt/lists/*
-
 
 # Create a new directory for our application code
 # And set it as the working directory
@@ -52,8 +36,7 @@ WORKDIR /app
 
 # Copy just the dependency files first, for more efficient layer caching
 COPY pyproject.toml uv.lock ./
-RUN mkdir -p src
-
+COPY src_deploy ./src
 # Install Python dependencies using UV's lock file
 # --locked ensures we use exact versions from uv.lock for reproducible builds
 # This creates a virtual environment and installs all dependencies
@@ -63,26 +46,21 @@ RUN uv sync --locked
 # Copy all remaining application files into the container
 # This includes source code, configuration files, and dependency specifications
 # (Excludes files specified in .dockerignore)
-COPY src ./src
-COPY src_deploy ./src_deploy
-COPY .env.local .env.local
-COPY Dockerfile_deploy Dockerfile
-COPY .livekit/cli-config.yaml .livekit/cli-config.yaml
 
 # Change ownership of all app files to the non-privileged user
 # This ensures the application can read/write files as needed
 RUN chown -R appuser:appuser /app
-
-# Switch to the non-privileged user for all subsequent operations
-# This improves security by not running as root
-USER appuser
 
 # Pre-download any ML models or files the agent needs
 # This ensures the container is ready to run immediately without downloading
 # dependencies at runtime, which improves startup time and reliability
 RUN uv run python3 src/agent.py download-files
 
+# Switch to the non-privileged user for the final runtime command
+# This improves security by not running the app as root
+USER appuser
+
 # Run the application using UV
 # UV will activate the virtual environment and run the agent.
-# The "start" command tells the worker to connect to LiveKit and begin waiting for jobs.
-#CMD ["uv", "run", "src/agent.py", "start"]
+# The "start" command tells the agent server to connect to LiveKit and begin waiting for jobs.
+CMD ["uv", "run", "python3", "src/agent.py", "start"]

@@ -11,3 +11,6 @@ attach:
 
 remove:
 	podman rm -f lemonslice
+
+rmi:
+	podman image rm lemonslice
