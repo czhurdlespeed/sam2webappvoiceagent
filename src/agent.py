@@ -12,8 +12,6 @@ from livekit.agents import (
     AudioConfig,
     BackgroundAudioPlayer,
     BuiltinAudioClip,
-    ChatContext,
-    ChatMessage,
     JobContext,
     JobProcess,
     JobRequest,
@@ -27,27 +25,31 @@ from livekit.agents import (
 from livekit.plugins import (
     cartesia,
     deepgram,
-    google,
     lemonslice,
     noise_cancellation,
+    openai,
     silero,
 )
 from parallel import AsyncParallel
 from parallel.types.beta import ExcerptSettingsParam, SearchResult
+from pydantic import ValidationError
 from pydantic_core import from_json
+from pymongo.errors import PyMongoError
 
-from observability import setup_observability
-from prompts import initial_assistant_prompt
-from rag import RAG, MongoDB
-from usersession import (
+from .email import (
+    confirm_conversation_history,
+    generate_summary,
+    send_email,
+    template_email,
+)
+from .observability import setup_observability
+from .prompts import initial_assistant_prompt
+from .rag import RAG, MongoDB
+from .usersession import (
     EmbedUserData,
+    UserAgentUsage,
     UserSession,
-    fetch_user_info,
-    fetch_user_sessions,
-    fetch_user_time_used,
-    protected_create_session,
-    user_exists,
-    write_user_session,
+    VoiceAgentUsageDatabase,
 )
 
 # Load from project root so it works when cwd is not the repo root (e.g. in container job subprocess)
@@ -57,19 +59,14 @@ load_dotenv(".env.local")
 class Assistant(Agent):
     def __init__(
         self,
-        parallel_client: AsyncParallel,
         rag: RAG,
         user_data: dict[str, str] | None = None,
     ) -> None:
         super().__init__(instructions=initial_assistant_prompt)
-        assert isinstance(parallel_client, AsyncParallel), (
-            "parallel_client must be an instance of AsyncParallel"
-        )
         assert isinstance(rag, RAG), "rag must be an instance of RAG"
-        self._parallel_client = parallel_client
         self._rag = rag
         self._user_data = user_data or {}
-        self._rag_has_results = False
+        self._parallel_client = AsyncParallel(api_key=os.getenv("PARALLEL_API_KEY"))
 
     async def on_enter(self):
         name = self._user_data.get("name", "").strip().split(" ")[0]
@@ -79,42 +76,40 @@ class Assistant(Agent):
             instructions = "In one sentence, welcome the user, introduce yourself, and ask them how you can help them today."
         await self.session.generate_reply(instructions=instructions).wait_for_playout()
 
-    async def on_user_turn_completed(
-        self, turn_ctx: ChatContext, new_message: ChatMessage
-    ) -> None:
-        # Reset flag for new turn
-        self._rag_has_results = False
+    @function_tool()
+    async def search_knowledge_base(
+        self,
+        context: RunContext,
+        query: str,
+    ) -> str:
+        """
+        Use this tool to search the RAG knowledge base for information about low rank adaptation, configurations, manufacturing processes, or training AI models.
+        """
+
+        async def _speak_status_update(delay: float = 2):
+            await asyncio.sleep(delay)
+            await context.session.generate_reply(
+                instructions="In one sentence, let the user know you are searching the knowledge base, it's taking a bit longer than expected, and will be right back!",
+                allow_interruptions=False,
+            )
+
+        speak_task = asyncio.create_task(_speak_status_update())
         try:
             rag_results = await self._rag.get_query_results(
-                query=new_message.text_content,
+                query=query,
                 rag_top_k=15,
                 rerank_top_k=5,
                 verbose=False,
             )
-            formatted_results = RAG.format_results_for_llm(rag_results)
-            if formatted_results:
-                turn_ctx.add_message(
-                    role="assistant",
-                    content=formatted_results
-                    + " Since information was found in the knowledge base, don't use the web_search tool to search the web.",
-                )
-                turn_ctx.add_message(
-                    role="developer",
-                    content="Since information was found in the knowledge base, don't use the web_search tool to search the web.",
-                )
-            else:
-                turn_ctx.add_message(
-                    role="developer",
-                    content="No information was found in the knowledge base, so use the web_search tool to provide the user with the information they are looking for.",
-                )
+            return RAG.format_results_for_llm(rag_results, relavence_threshold=0.8)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except PyMongoError as e:
             logfire.error("RAG search failed", error=e)
-            turn_ctx.add_message(
-                role="assistant",
-                content="Sorry, I couldn’t access the knowledge base just now. Please try again.",
-            )
+            return "Sorry, I couldn’t access the knowledge base just now. Please try again."
+        finally:
+            speak_task.cancel()
+            await asyncio.gather(speak_task, return_exceptions=True)
 
     @function_tool()
     async def web_search(
@@ -124,7 +119,7 @@ class Assistant(Agent):
         search_queries: list[str],
     ) -> str:
         """
-        Use this tool to search the internet if the user asks for information not found in the RAG knowledge base.
+        Use this tool to search the internet if the user asks for information that was not found in the RAG knowledge base.
 
         Args:
             objective: Natural-language description of the web research goal, including source or freshness guidance and broader context from the task. Maximum 5000 characters.
@@ -135,14 +130,12 @@ class Assistant(Agent):
             search_queries: [“Founding year UN”, “Year of founding United Nations”]
         """
 
-        context.disallow_interruptions()
-
         async def _speak_status_update(delay: float = 2):
             await asyncio.sleep(delay)
             await context.session.generate_reply(
                 instructions="In one sentence, let the user know you are searching the web, it's taking a bit longer than expected, and will be right back!",
                 allow_interruptions=False,
-            ).wait_for_playout()
+            )
 
         speak_task = asyncio.create_task(_speak_status_update())
         try:
@@ -173,16 +166,10 @@ class Assistant(Agent):
 
 
 server = AgentServer()
+setup_observability()
 
 
 def prewarm(proc: JobProcess):
-    setup_observability()
-    proc.userdata["parallel_client"] = AsyncParallel(
-        api_key=os.getenv("PARALLEL_API_KEY")
-    )
-    mongodb = MongoDB()
-    mongodb.connect()
-    proc.userdata["rag"] = RAG(vector_database=mongodb)
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -200,13 +187,14 @@ async def on_session_end(ctx: JobContext) -> None:
 def parse_metadata(metadata: str) -> EmbedUserData | None:
     try:
         return EmbedUserData.model_validate(from_json(metadata, allow_partial=True))
-    except Exception as e:
-        logfire.error("Failed to parse metadata", error=e)
+    except ValidationError as e:
+        logfire.error("Failed to parse metadata", error=e, exc_info=True)
         return None
 
 
 async def on_request(request: JobRequest) -> None:
     """Reject jobs that don't have valid user_id in metadata before the job runs."""
+    logfire.info(f"Metadata: {request.job.metadata}")
     if not request.job.metadata or request.job.metadata.strip() == "":
         logfire.error("Job rejected: no metadata provided", job_id=request.id)
         await request.reject()
@@ -220,25 +208,26 @@ async def on_request(request: JobRequest) -> None:
         )
         await request.reject()
         return
-    user_exists_in_db = await user_exists(user_data.user_id)
-    if not user_exists_in_db:
-        logfire.error(
-            "Job rejected: user does not exist",
-            job_id=request.id,
-            user_id=user_data.user_id,
-        )
-        await request.reject()
-        return
-    time_used = await fetch_user_time_used(user_data.user_id)
-    if time_used >= int(os.getenv("SESSION_TIME_LIMIT_SECONDS", "120")):
-        logfire.error(
-            "Job rejected: user has reached the session time limit",
-            job_id=request.id,
-            user_id=user_data.user_id,
-        )
-        await request.reject()
-        return
-    await request.accept()
+    async with VoiceAgentUsageDatabase() as database:
+        user_exists_in_db = await database.user_exists(user_data.user_id)
+        if not user_exists_in_db:
+            logfire.error(
+                "Job rejected: user does not exist",
+                job_id=request.id,
+                user_id=user_data.user_id,
+            )
+            await request.reject()
+            return
+        time_used = await database.fetch_user_time_used(user_data.user_id)
+        if time_used >= int(os.getenv("SESSION_TIME_LIMIT_SECONDS", "120")):
+            logfire.error(
+                "Job rejected: user has reached the session time limit",
+                job_id=request.id,
+                user_id=user_data.user_id,
+            )
+            await request.reject()
+            return
+        await request.accept()
 
 
 @server.rtc_session(
@@ -251,37 +240,46 @@ async def entrypoint(ctx: JobContext):
         "room": ctx.room.name,
     }
     user_data = parse_metadata(ctx.job.metadata)
+    assert user_data is not None, "User id metadata is required"
     ctx.log_context_fields.update(**user_data.model_dump())
     try:
-        (name, email), user_sessions = await asyncio.gather(
-            fetch_user_info(user_data.user_id),
-            fetch_user_sessions(user_data.user_id),
-        )
-        logfire.info("User info", name=name, email=email)
-        if not user_sessions:
-            logfire.info(
-                f"User {user_data.user_id} has no user sessions, creating first user session"
+        async with VoiceAgentUsageDatabase() as database:
+            user_agent_usage: UserAgentUsage = (
+                await database.fetch_user_info_and_sessions(
+                    user_data.user_id,
+                )
             )
-            user_session: UserSession = await protected_create_session(
-                user_data.user_id, len(user_sessions)
+
+        logfire.info("User info", user_agent_usage=user_agent_usage.model_dump())
+        if (num_sessions := len(user_agent_usage.session_ids)) == 0:
+            logfire.info(
+                f"User {user_data.user_id} has no user sessions, creating first user session",
+                num_sessions=num_sessions,
+            )
+            user_session: UserSession = UserSession(
+                user_id=user_data.user_id,
+                session_id=num_sessions + 1,
+                seconds_used=0,
             )
             logfire.info("User session created", info=user_session.model_dump())
         else:
             logfire.info(
-                f"User has {len(user_sessions)} user sessions, updating with existing user sessions"
+                f"User has {num_sessions} user sessions, updating with existing user sessions"
             )
             user_session: UserSession = UserSession(
                 user_id=user_data.user_id,
-                session_id=len(user_sessions),
-                seconds_used=sum(
-                    user_session.seconds_used for user_session in user_sessions
-                ),
+                session_id=num_sessions + 1,
+                seconds_used=sum(user_agent_usage.seconds_used),
             )
             logfire.info(
                 f"User has used {user_session.seconds_used} seconds in previous sessions."
             )
     except Exception as e:
-        logfire.error("Failed to acquire user metadata and/or user info", error=e)
+        logfire.error(
+            "Failed to acquire or set user metadata, info, and/or agent usage",
+            error=e,
+            exc_info=True,
+        )
         await ctx.room.disconnect()
         await ctx.delete_room()
         ctx.shutdown(reason="Failed to acquire user metadata and/or user info")
@@ -294,14 +292,15 @@ async def entrypoint(ctx: JobContext):
             eot_threshold=0.7,
             eot_timeout_ms=1_000,
         ),
-        llm=google.LLM(
-            model="gemini-3-flash-preview",
+        llm=openai.responses.LLM(
+            model="gpt-4.1-nano",
+            parallel_tool_calls=False,
         ),
         tts=cartesia.TTS(
             model="sonic-3",
-            voice=os.getenv("CARTESIA_VOICE_ID"),
+            voice=str(os.getenv("CARTESIA_VOICE_ID")),
             emotion="Enthusiastic",
-            pronunciation_dict_id=os.getenv("CARTESIA_PRONUNCIATION_DICT_ID"),
+            pronunciation_dict_id=str(os.getenv("CARTESIA_PRONUNCIATION_DICT_ID")),
         ),
         turn_detection="stt",
         vad=ctx.proc.userdata["vad"],
@@ -312,7 +311,7 @@ async def entrypoint(ctx: JobContext):
 
     session_ready = asyncio.Event()
 
-    async def session_time_limit(user_session: UserSession | None):
+    async def session_time_limit(user_session: UserSession):
         logfire.info(
             "Timer started",
             time_limit_env=os.getenv("SESSION_TIME_LIMIT_SECONDS", "120"),
@@ -399,6 +398,9 @@ async def entrypoint(ctx: JobContext):
         agent_prompt="Enthusiastic and friendly assistant",
     )
 
+    mongodb = await MongoDB.connect()
+    rag = RAG(vector_database=mongodb)
+
     # Wait until the room disconnects (user left or timer fired)
     disconnect_fut = asyncio.get_running_loop().create_future()
 
@@ -422,8 +424,7 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(_disconnect_room())
 
     async def _disconnect_room():
-        await ctx.room.disconnect()
-        await ctx.delete_room()
+        await mongodb.disconnect()
         _complete_disconnect()
 
     ctx.room.on("disconnected", _on_room_disconnected)
@@ -434,11 +435,10 @@ async def entrypoint(ctx: JobContext):
 
         await session.start(
             agent=Assistant(
-                parallel_client=ctx.proc.userdata["parallel_client"],
-                rag=ctx.proc.userdata["rag"],
+                rag=rag,
                 user_data={
-                    "name": name,
-                    "email": email,
+                    "name": user_agent_usage.name,
+                    "email": user_agent_usage.email,
                 },
             ),
             room=ctx.room,
@@ -469,25 +469,67 @@ async def entrypoint(ctx: JobContext):
         except BaseException:
             pass  # Session/room may be closing; any exception here is expected during cleanup
 
-        try:
-            await ctx.delete_room()
-        except Exception as e:
-            logfire.warning("delete_room failed (room may already be deleted)", error=e)
-
-        if user_session is not None:
+        # Do DB write and email before delete_room(); the worker may shut down once the room is deleted
+        if user_session:
             seconds_used = int(time.time() - time_start)
             user_session.seconds_used = seconds_used
             logfire.info(f"Writing session to database. Seconds used: {seconds_used}")
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(write_user_session(user_session)), timeout=5
-                )
-                logfire.info(
-                    "User session written to database",
-                    user_session=user_session.model_dump(),
-                )
+                async with VoiceAgentUsageDatabase() as database:
+                    await asyncio.wait_for(
+                        asyncio.shield(database.write_user_session(user_session)),
+                        timeout=5,
+                    )
+                    logfire.info(
+                        "User session written to database",
+                        user_agent_usage=user_session.model_dump(),
+                    )
             except Exception as e:
-                logfire.error("Failed to write user session to database", error=e)
+                logfire.error(
+                    "Failed to write user session to database", error=e, exc_info=True
+                )
+            if (
+                confirm_conversation_history(
+                    session.history.to_provider_format(format="openai")[0]
+                )
+                and user_agent_usage.email_verified
+            ):
+
+                async def send_email_workflow():
+                    summary = await generate_summary(
+                        session.history.to_provider_format(format="openai")[0]
+                    )
+                    logfire.info("Summary generated", summary=summary)
+                    total_seconds = (
+                        sum(user_agent_usage.seconds_used) + user_session.seconds_used
+                    )
+                    session_count = len(user_agent_usage.session_ids) + 1
+                    html = template_email(
+                        user_agent_usage,
+                        summary,
+                        total_seconds_used=total_seconds,
+                        session_count=session_count,
+                    )
+                    logfire.info("HTML generated", html=html)
+                    send_email(
+                        user_agent_usage,
+                        html,
+                        session_count=session_count,
+                    )
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(send_email_workflow()),
+                        timeout=15,
+                    )
+                except Exception as e:
+                    logfire.error("Failed to send email", error=e, exc_info=True)
+
+        try:
+            await ctx.room.disconnect()
+            await ctx.delete_room()
+        except Exception as e:
+            logfire.warning("delete_room failed (room may already be deleted)", error=e)
 
 
 if __name__ == "__main__":

@@ -25,16 +25,14 @@ def setup_observability():
             "LOGFIRE_TOKEN is not set. Add LOGFIRE_TOKEN to .env.local or set the environment variable."
         )
 
-    def scrubbing_callback(match: logfire.ScrubMatch):
-        path_str = ".".join(str(p) for p in match.path) if match.path else ""
-        if "session_id" in path_str and isinstance(match.value, int):
-            return match.value
-        return None
+    def scrubbing_callback(m: logfire.ScrubMatch):
+        if m.pattern_match.group(0) == "session":
+            return m.value
 
     logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(callback=scrubbing_callback),
         service_name="voice-agent",
         token=logfire_token,
-        scrubbing=logfire.ScrubbingOptions(callback=scrubbing_callback),
     )
 
     # Ensure LiveKit uses the same tracer provider that Logfire configured

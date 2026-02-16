@@ -80,9 +80,9 @@ USER appuser
 # Pre-download any ML models or files the agent needs
 # This ensures the container is ready to run immediately without downloading
 # dependencies at runtime, which improves startup time and reliability
-RUN uv run python3 src/agent.py download-files
+RUN uv run python3 -m src.agent download-files
 
 # Run the application using UV
 # UV will activate the virtual environment and run the agent.
 # The "start" command tells the worker to connect to LiveKit and begin waiting for jobs.
-#CMD ["uv", "run", "src/agent.py", "start"]
+#CMD ["uv", "run", "python3", "-m", "src.agent", "start"]
