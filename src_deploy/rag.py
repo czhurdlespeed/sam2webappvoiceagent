@@ -3,16 +3,17 @@ import os
 from abc import ABC, abstractmethod
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterator, List, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 import certifi
-import pymongo
 import regex as re
 import voyageai
 from landingai_ade import LandingAIADE
-from pymongo import AsyncMongoClient
+from pymongo import AsyncMongoClient, server_api
+from pymongo.errors import ConnectionFailure
 from pymongo.operations import SearchIndexModel
 from rich import print
+from voyageai.object.contextualized_embeddings import ContextualizedEmbeddingsResult
 
 
 class VectorDatabase(ABC):
@@ -53,75 +54,105 @@ def parse_pdfs(pdf_directory: Path) -> None:
 
 class MongoDB(VectorDatabase):
     def __init__(self) -> None:
+        self.load_env()
         self._client: AsyncMongoClient | None = None
-        self._voyage_client = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
+
+    def load_env(self) -> None:
+        VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+        VOYAGE_EMBEDDING_MODEL = os.getenv("VOYAGE_EMBEDDING_MODEL")
+        MONGO_URI = os.getenv("MONGO_URI")
+        if not VOYAGE_API_KEY:
+            raise ValueError(
+                "VOYAGE_API_KEY is not set. Add VOYAGE_API_KEY to .env.local or set the environment variable."
+            )
+        if not VOYAGE_EMBEDDING_MODEL:
+            raise ValueError(
+                "VOYAGE_EMBEDDING_MODEL is not set. Add VOYAGE_EMBEDDING_MODEL to .env.local or set the environment variable."
+            )
+        if not MONGO_URI:
+            raise ValueError(
+                "MONGO_URI is not set. Add MONGO_URI to .env.local or set the environment variable."
+            )
+        self._voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
+        self._embedding_model = VOYAGE_EMBEDDING_MODEL
+        self._mongo_uri = MONGO_URI
 
     @property
-    def database(self) -> AsyncMongoClient | None:
+    def database(self) -> AsyncMongoClient:
+        if self._client is None:
+            raise RuntimeError(
+                "Not connected. Use await MongoDB.create() or await db.connect() first."
+            )
         return self._client
 
-    def connect(self) -> None:
+    @classmethod
+    async def connect(cls) -> "MongoDB":
         try:
-            self._client = AsyncMongoClient(
-                os.getenv("MONGO_URI"),
+            instance = cls()
+            instance._client = AsyncMongoClient(
+                instance._mongo_uri,
                 tlsCAFile=certifi.where(),
-                server_api=pymongo.server_api.ServerApi(
+                server_api=server_api.ServerApi(
                     version="1",
                     strict=False,
                     deprecation_errors=True,
                 ),
             )
+            await instance._client.admin.command("ping")
             print("[green]Connected successfully to MongoDB[/green]")
-        except Exception as e:
-            raise Exception(f"[red]Error connecting to MongoDB: {e}[/red]")
+            return instance
+        except ConnectionFailure as e:
+            raise ConnectionFailure(f"Error connecting to MongoDB: {e}")
 
     async def disconnect(self) -> None:
-        """Stop using the connection for this instance. Does not close the shared client."""
         if self._client is None:
             return
-        await self._client.close()
-        self._client = None
+        try:
+            await self._client.close()
+        except Exception as e:
+            raise Exception(f"Error disconnecting from MongoDB: {e}")
 
     async def create_collection(self, collection_name: str) -> None:
-        if self._database is None:
-            raise RuntimeError(
-                "Not connected. Use await MongoDB.create() or await db.connect() first."
-            )
-        await self._database["sam2webappdocs"].create_collection(collection_name)
+        if self._client is None:
+            raise RuntimeError("Not connected. Use await MongoDB.connect() first.")
+        assert isinstance(self._client, AsyncMongoClient)
+        await self._client["sam2webappdocs"].create_collection(collection_name)
         print(f"[green]Collection {collection_name} created successfully[/green]")
 
     async def delete_collection(self, collection_name: str) -> None:
-        if self._database is None:
-            raise RuntimeError(
-                "Not connected. Use await MongoDB.create() or await db.connect() first."
-            )
+        if self._client is None:
+            raise RuntimeError("Not connected. Use await MongoDB.connect() first.")
 
         if collection_name not in await self.list_collections():
             print(f"[red]Collection {collection_name} not found in database[/red]")
             return
-        await self._database["sam2webappdocs"].drop_collection(collection_name)
+        assert isinstance(self._client, AsyncMongoClient)
+        await self._client["sam2webappdocs"].drop_collection(collection_name)
         print(f"[green]Collection {collection_name} deleted successfully[/green]")
 
-    async def list_collections(self) -> List[str]:
-        if self.database is None:
-            raise RuntimeError(
-                "Not connected. Use await MongoDB.create() or await db.connect() first."
-            )
-        return await self.database["sam2webappdocs"].list_collection_names()
+    async def list_collections(self) -> list[str]:
+        if self._client is None:
+            raise RuntimeError("Not connected. Use await MongoDB.connect() first.")
+        assert isinstance(self._client, AsyncMongoClient)
+        return await self._client["sam2webappdocs"].list_collection_names()
 
     @property
-    def embedding_model(self) -> Callable[List[List[str]], List[float]]:
+    def embedding_model(self) -> Callable[..., Any]:
         return partial(
             self._voyage_client.contextualized_embed,
-            model=os.getenv("VOYAGE_EMBEDDING_MODEL"),
+            model=self._embedding_model,
             output_dimension=1024,
         )
 
     async def insert_embeddings(
-        self, text_embedding_pairs: Iterator[Tuple[str, List[float]]]
+        self,
+        text_embedding_pairs: List[Tuple[List[str], ContextualizedEmbeddingsResult]],
     ) -> None:
-        collection = self.database["sam2webappdocs"]["vectorstore"]
-        docs_to_insert = []
+        if self._client is None:
+            raise RuntimeError("Not connected. Use await MongoDB.connect() first.")
+        assert isinstance(self._client, AsyncMongoClient)
+        collection = self._client["sam2webappdocs"]["vectorstore"]
+        docs_to_insert: List[Dict[str, str | float]] = []
         for document, document_embeddings in text_embedding_pairs:
             for text, embedding in zip(document, document_embeddings.embeddings):
                 docs_to_insert.append(
@@ -133,7 +164,8 @@ class MongoDB(VectorDatabase):
         await collection.insert_many(docs_to_insert)
 
     async def create_vector_index(self) -> None:
-        collection = self.database["sam2webappdocs"]["vectorstore"]
+        assert isinstance(self._client, AsyncMongoClient)
+        collection = self._client["sam2webappdocs"]["vectorstore"]
         index_name = "vector_index"
         cursor = await collection.list_search_indexes(index_name)
         existing_indexes = await cursor.to_list()
@@ -163,7 +195,7 @@ class MongoDB(VectorDatabase):
             )
 
         # Wait for index to become queryable
-        def is_queryable(index: dict) -> bool:
+        def is_queryable(index: Mapping[str, Any]) -> bool:
             return index.get("queryable") is True
 
         while True:
@@ -180,17 +212,15 @@ class RAG:
 
     BATCH_TOKEN_LIMIT = 120_000
 
-    @staticmethod
-    def _token_count(chunks: List[str]) -> int:
-        client = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
+    def _token_count(self, chunks: List[str]) -> int:
+        client = self.vector_database._voyage_client
         tokenized = client.tokenize(chunks, model="voyage-4-lite")
         return sum(len(t) for t in tokenized)
 
-    @staticmethod
     def _split_document_if_too_many_tokens(
-        chunks: List[str], document_name: str
+        self, chunks: List[str], document_name: str
     ) -> List[List[str]]:
-        client = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
+        client = self.vector_database._voyage_client
         tokenized = client.tokenize(chunks, model="voyage-4-lite")
         total_tokens = sum(len(chunk) for chunk in tokenized)
         if total_tokens <= 32_000:
@@ -246,14 +276,16 @@ class RAG:
             batches.append(current_batch)
         return batches
 
-    async def upload_to_database(self, document_dir: Path) -> List:
+    async def upload_to_database(self, document_dir: Path) -> None:
         documents_chunks = self._chunk_documents(document_dir)
         batches = self._batch_by_tokens(documents_chunks)
-        all_pairs: List[Tuple[List[str], object]] = []
+        all_pairs: List[Tuple[List[str], ContextualizedEmbeddingsResult]] = []
         for batch in batches:
-            results = self.vector_database.embedding_model(
-                inputs=batch, input_type="document"
-            ).results
+            results: List[ContextualizedEmbeddingsResult] = (
+                self.vector_database.embedding_model(
+                    inputs=batch, input_type="document"
+                ).results
+            )
             for doc, doc_embeddings in zip(batch, results):
                 all_pairs.append((doc, doc_embeddings))
         await self.vector_database.insert_embeddings(iter(all_pairs))
@@ -338,8 +370,8 @@ class RAG:
 
 
 async def main() -> None:
-    mongodb = MongoDB()
-    mongodb.connect()
+    mongodb = await MongoDB.connect()
+
     rag = RAG(vector_database=mongodb)
     results = await rag.get_query_results(
         query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?",

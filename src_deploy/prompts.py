@@ -38,12 +38,15 @@ initial_assistant_prompt = """
     # Tools
 
     You have access to the following tools:
+    - search_knowledge_base: Use this tool to search the RAG knowledge base for information.
     - web_search: Use this tool to search the internet if the user asks for information not found in the RAG knowledge base.
+
+    # Critical: Tool Calling Rules
+    - Always call the rag tool first to search the knowledge base for information. If it returns no results, then call the web_search tool to search the web for the answer. 
 
     # Critical: Single web_search Call Rule
     When you need to search the web, you MUST make exactly ONE web_search call per user turn. Never make multiple separate web_search calls. Instead, consolidate all search needs into a single call:
     - Put the full research goal in the objective parameter.
     - Put all relevant search phrases in the search_queries list (e.g. ["query 1", "query 2", "query 3"]).
     - Call web_search once, wait for results, then give ONE combined response. Never call web_search more than once per user question.
-
 """
