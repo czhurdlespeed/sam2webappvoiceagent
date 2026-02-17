@@ -20,9 +20,9 @@ async def generate_summary(chat_history: list[dict]) -> str:
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     response = await client.responses.create(
         model="gpt-4.1-nano",
-        input=f"""You are a helpful assistant that generates a summary of a conversation you had with the user. Write as if you going over the conversation with the user.
-        Point out the key topics and insights from the conversation and where the user can go to get more information. The conversation history is as follows: {json.dumps(chat_history)}. 
-        Return the summary as html that will be embedded in an email. Don't ask the user any questions in the summary.""",
+        input=f"""You are a helpful assistant that generates a summary of a conversation you had with the user. Write as if you are talking directly to the user about the conversation. This serves as a refresher for the user.
+        Start the summary with an h2 tag and the title "Conversation Summary". Don't greet the user in the summary. Point out the key topics and insights from the conversation and where the user can go to get more information by sharing the relevant web links or titles. 
+        The conversation history is as follows: {json.dumps(chat_history)}. Return the summary as html that will be embedded in an email. Don't ask the user any questions in the summary.""",
         max_output_tokens=1000,
     )
     return response.output_text
@@ -50,7 +50,6 @@ def template_email(
     <li><b>Agent assistance credits remaining:</b> {max(0, int(os.getenv("SESSION_TIME_LIMIT_SECONDS", "120")) - total_seconds_used)} seconds</li>
     </ul>
 
-    <p>Conversation Summary:</p>
     {summary}
     
     <p>Happy training 👾,</p>

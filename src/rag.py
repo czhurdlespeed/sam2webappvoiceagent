@@ -380,7 +380,7 @@ async def main() -> None:
         query="How does fine-tuning SAM 2 help with manufacturing video object segmentation?",
         verbose=False,
     )
-    print(RAG.format_results_for_llm(results, relavence_threshold=0.85))
+    print(RAG.format_results_for_llm(results, relavence_threshold=0.75))
     await mongodb.disconnect()
 
 

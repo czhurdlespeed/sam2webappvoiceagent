@@ -21,6 +21,7 @@ from livekit.agents import (
     metrics,
     room_io,
 )
+from livekit.api import DeleteRoomRequest, LiveKitAPI
 from livekit.plugins import (
     cartesia,
     deepgram,
@@ -70,7 +71,9 @@ class Assistant(Agent):
             instructions = f"In one sentence, welcome {name},  introduce yourself, and ask how you can help them today."
         else:
             instructions = "In one sentence, welcome the user, introduce yourself, and ask them how you can help them today."
-        await self.session.generate_reply(instructions=instructions).wait_for_playout()
+        await self.session.generate_reply(
+            instructions=instructions, allow_interruptions=False
+        ).wait_for_playout()
 
     @function_tool()
     async def search_knowledge_base(
@@ -97,7 +100,7 @@ class Assistant(Agent):
                 rerank_top_k=5,
                 verbose=False,
             )
-            return RAG.format_results_for_llm(rag_results, relavence_threshold=0.8)
+            return RAG.format_results_for_llm(rag_results, relavence_threshold=0.75)
         except asyncio.CancelledError:
             raise
         except PyMongoError as e:
@@ -162,10 +165,14 @@ class Assistant(Agent):
 
 
 server = AgentServer()
-setup_observability()
+try:
+    setup_observability()
+except Exception:
+    pass
 
 
 def prewarm(proc: JobProcess):
+    setup_observability()
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -193,6 +200,8 @@ async def on_request(request: JobRequest) -> None:
     logfire.info(f"Metadata: {request.job.metadata}")
     if not request.job.metadata or request.job.metadata.strip() == "":
         logfire.error("Job rejected: no metadata provided", job_id=request.id)
+        async with LiveKitAPI() as lkapi:
+            await lkapi.room.delete_room(DeleteRoomRequest(room=request.room.name))
         await request.reject()
         return
     user_data = parse_metadata(request.job.metadata)
@@ -202,6 +211,8 @@ async def on_request(request: JobRequest) -> None:
             job_id=request.id,
             metadata=request.job.metadata,
         )
+        async with LiveKitAPI() as lkapi:
+            await lkapi.room.delete_room(DeleteRoomRequest(room=request.room.name))
         await request.reject()
         return
     async with VoiceAgentUsageDatabase() as database:
@@ -212,6 +223,8 @@ async def on_request(request: JobRequest) -> None:
                 job_id=request.id,
                 user_id=user_data.user_id,
             )
+            async with LiveKitAPI() as lkapi:
+                await lkapi.room.delete_room(DeleteRoomRequest(room=request.room.name))
             await request.reject()
             return
         time_used = await database.fetch_user_time_used(user_data.user_id)
@@ -221,6 +234,8 @@ async def on_request(request: JobRequest) -> None:
                 job_id=request.id,
                 user_id=user_data.user_id,
             )
+            async with LiveKitAPI() as lkapi:
+                await lkapi.room.delete_room(DeleteRoomRequest(room=request.room.name))
             await request.reject()
             return
         await request.accept()
@@ -276,10 +291,14 @@ async def entrypoint(ctx: JobContext):
             error=e,
             exc_info=True,
         )
-        await ctx.room.disconnect()
-        await ctx.delete_room()
-        ctx.shutdown(reason="Failed to acquire user metadata and/or user info")
-        return
+        try:
+            await ctx.room.disconnect()
+            await ctx.delete_room(room_name=ctx.room.name)
+            await ctx.api.aclose()
+        except Exception as e:
+            logfire.error("Failed to disconnect or delete room", error=e, exc_info=True)
+        finally:
+            return
 
     session = AgentSession(
         stt=deepgram.STTv2(
@@ -301,11 +320,13 @@ async def entrypoint(ctx: JobContext):
         turn_detection="stt",
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=False,
+        max_tool_steps=1,
     )
 
     time_start = time.time()
 
     session_ready = asyncio.Event()
+    time_limit_handled = False  # Flag to track if time limit cleanup was already done
 
     async def session_time_limit(user_session: UserSession):
         logfire.info(
@@ -338,26 +359,104 @@ async def entrypoint(ctx: JobContext):
             try:
                 await session.interrupt(force=True)
                 if user_session.session_id > 0:
-                    await session.generate_reply(
-                        instructions="In one sentence, apologize and state that you user has reached the assistant's limit and you must disconnect now.",
+                    await session.say(
+                        text="I'm sorry, but your sessions have reached the time limit and I must disconnect now. Goodbye!",
                         allow_interruptions=False,
                     ).wait_for_playout()
                 else:
                     await session.generate_reply(
-                        instructions="In one sentence, apologize and state that the session time limit has been reached and you must disconnect now.",
+                        instructions="I'm sorry, but this session has reached the time limit and I must disconnect now. Goodbye!",
                         allow_interruptions=False,
                     ).wait_for_playout()
 
-                await ctx.room.disconnect()
-                logfire.info("Room disconnected due to session time limit")
+                # Write session to database and send email before deleting room
+                seconds_used = int(time.time() - time_start)
+                user_session.seconds_used = seconds_used
+                logfire.info(
+                    f"Writing session to database (time limit). Seconds used: {seconds_used}"
+                )
+                try:
+                    async with VoiceAgentUsageDatabase() as database:
+                        await asyncio.wait_for(
+                            asyncio.shield(database.write_user_session(user_session)),
+                            timeout=5,
+                        )
+                        logfire.info(
+                            "User session written to database (time limit)",
+                            user_agent_usage=user_session.model_dump(),
+                        )
+                except Exception as e:
+                    logfire.error(
+                        "Failed to write user session to database (time limit)",
+                        error=e,
+                        exc_info=True,
+                    )
+
+                # Send email if conversation history exists and email is verified
+                has_conversation_history = confirm_conversation_history(
+                    session.history.to_provider_format(format="openai")[0]
+                )
+                email_verified = user_agent_usage.email_verified
+
+                logfire.info(
+                    "Email sending check (time limit)",
+                    has_conversation_history=has_conversation_history,
+                    email_verified=email_verified,
+                    will_send_email=has_conversation_history and email_verified,
+                )
+
+                if has_conversation_history and email_verified:
+
+                    async def send_email_workflow():
+                        summary = await generate_summary(
+                            session.history.to_provider_format(format="openai")[0]
+                        )
+                        logfire.info("Summary generated (time limit)", summary=summary)
+                        total_seconds = (
+                            sum(user_agent_usage.seconds_used)
+                            + user_session.seconds_used
+                        )
+                        session_count = len(user_agent_usage.session_ids) + 1
+                        html = template_email(
+                            user_agent_usage,
+                            summary,
+                            total_seconds_used=total_seconds,
+                            session_count=session_count,
+                        )
+                        logfire.info("HTML generated (time limit)", html=html)
+                        send_email(
+                            user_agent_usage,
+                            html,
+                            session_count=session_count,
+                        )
+
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(send_email_workflow()),
+                            timeout=15,
+                        )
+                        logfire.info("Email sent successfully after session time limit")
+                    except Exception as e:
+                        logfire.error(
+                            "Failed to send email (time limit)", error=e, exc_info=True
+                        )
+                else:
+                    logfire.info(
+                        "Email not sent (time limit)",
+                        reason="missing_conversation_history"
+                        if not has_conversation_history
+                        else "email_not_verified",
+                    )
+
             except Exception as e:
                 logfire.error(
                     "Session time limit: failed to announce or disconnect",
                     error=e,
                     exc_info=True,
                 )
-                await ctx.room.disconnect()
             finally:
+                nonlocal time_limit_handled
+                time_limit_handled = True
                 _complete_disconnect()
 
         except asyncio.CancelledError:
@@ -466,7 +565,8 @@ async def entrypoint(ctx: JobContext):
             pass  # Session/room may be closing; any exception here is expected during cleanup
 
         # Do DB write and email before delete_room(); the worker may shut down once the room is deleted
-        if user_session:
+        # Skip if time limit already handled these operations
+        if user_session and not time_limit_handled:
             seconds_used = int(time.time() - time_start)
             user_session.seconds_used = seconds_used
             logfire.info(f"Writing session to database. Seconds used: {seconds_used}")
@@ -484,12 +584,20 @@ async def entrypoint(ctx: JobContext):
                 logfire.error(
                     "Failed to write user session to database", error=e, exc_info=True
                 )
-            if (
-                confirm_conversation_history(
-                    session.history.to_provider_format(format="openai")[0]
-                )
-                and user_agent_usage.email_verified
-            ):
+            # Check if email should be sent (conversation history exists and email is verified)
+            has_conversation_history = confirm_conversation_history(
+                session.history.to_provider_format(format="openai")[0]
+            )
+            email_verified = user_agent_usage.email_verified
+
+            logfire.info(
+                "Email sending check",
+                has_conversation_history=has_conversation_history,
+                email_verified=email_verified,
+                will_send_email=has_conversation_history and email_verified,
+            )
+
+            if has_conversation_history and email_verified:
 
                 async def send_email_workflow():
                     summary = await generate_summary(
@@ -518,14 +626,23 @@ async def entrypoint(ctx: JobContext):
                         asyncio.shield(send_email_workflow()),
                         timeout=15,
                     )
+                    logfire.info("Email sent successfully after session end")
                 except Exception as e:
                     logfire.error("Failed to send email", error=e, exc_info=True)
+            else:
+                logfire.info(
+                    "Email not sent",
+                    reason="missing_conversation_history"
+                    if not has_conversation_history
+                    else "email_not_verified",
+                )
 
         try:
             await ctx.room.disconnect()
-            await ctx.delete_room()
+            await ctx.delete_room(room_name=ctx.room.name)
+            await session.aclose()
         except Exception as e:
-            logfire.warning("delete_room failed (room may already be deleted)", error=e)
+            logfire.warning("Failed to shutdown the session", error=e)
 
 
 if __name__ == "__main__":
